@@ -7,6 +7,7 @@
     using System.Threading.Tasks;
     using Context;
     using GreenPipes;
+    using GreenPipes.Internals.Extensions;
     using Microsoft.VisualStudio.TestPlatform.Utilities;
     using NUnit.Framework;
     using TestFramework;
@@ -286,6 +287,73 @@
 
 
     [TestFixture]
+    public class Processing_a_failing_batch_consumer :
+        InMemoryTestFixture
+    {
+        [Test]
+        public async Task Should_comply_with_retry_policy()
+        {
+            await InputQueueSendEndpoint.Send(new PingMessage());
+            await InputQueueSendEndpoint.Send(new PingMessage());
+
+            await _task.Task;
+
+            Assert.That(_consumer.Attempts, Is.EqualTo(2));
+        }
+
+        FailingBatchConsumer _consumer;
+        TaskCompletionSource<ConsumeContext<Fault<PingMessage>>> _task;
+
+        protected override void ConfigureInMemoryReceiveEndpoint(IInMemoryReceiveEndpointConfigurator configurator)
+        {
+            _consumer = new FailingBatchConsumer();
+
+            configurator.UseMessageRetry(r => r.Immediate(1));
+
+            configurator.Consumer(() => _consumer);
+
+            _task = GetTask<ConsumeContext<Fault<PingMessage>>>();
+            configurator.Handler<Fault<PingMessage>>(async m => _task.SetResult(m));
+        }
+    }
+
+
+    [TestFixture]
+    public class Processing_another_failing_batch_consumer :
+        InMemoryTestFixture
+    {
+        public Processing_another_failing_batch_consumer()
+        {
+            TestInactivityTimeout = TimeSpan.FromSeconds(3);
+        }
+
+        [Test]
+        public async Task Should_fault_once_per_message()
+        {
+            await InputQueueSendEndpoint.Send(new PingMessage());
+            await InputQueueSendEndpoint.Send(new PingMessage());
+
+            await InactivityTask.ContinueWith(t => { });
+
+            Assert.That(_individualFaults, Is.EqualTo(2));
+            Assert.That(_batchFaults, Is.EqualTo(0));
+        }
+
+        int _individualFaults;
+        int _batchFaults;
+
+        protected override void ConfigureInMemoryReceiveEndpoint(IInMemoryReceiveEndpointConfigurator configurator)
+        {
+            configurator.UseMessageRetry(r => r.Immediate(1));
+            configurator.Consumer(() => new FailingBatchConsumer());
+
+            configurator.Handler<Fault<PingMessage>>(async m => Interlocked.Increment(ref _individualFaults));
+            configurator.Handler<Fault<Batch<PingMessage>>>(async m => Interlocked.Increment(ref _batchFaults));
+        }
+    }
+
+
+    [TestFixture]
     public class Receiving_a_bunch_of_messages_in_a_batch_by_convention_using_mediator :
         InMemoryTestFixture
     {
@@ -477,6 +545,22 @@
                 _messageTask.TrySetException(new InvalidOperationException("Outbox context is not available at this point"));
 
             return TaskUtil.Completed;
+        }
+    }
+
+
+    class FailingBatchConsumer :
+        IConsumer<Batch<PingMessage>>
+    {
+        int _attempts;
+
+        public int Attempts => _attempts;
+
+        public Task Consume(ConsumeContext<Batch<PingMessage>> context)
+        {
+            Interlocked.Increment(ref _attempts);
+
+            throw new Exception("some error");
         }
     }
 }
